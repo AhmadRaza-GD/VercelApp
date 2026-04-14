@@ -1,51 +1,57 @@
-const Anthropic = require("@anthropic-ai/sdk").default;
+const TAXONOMY = [
+  { pattern: /^economy\/|\/economy\/|coin|iap|currency|pric|monetiz/i, category: "Economy" },
+  { pattern: /^ui\/|\/ui\/|^components\/|\/components\/|^styles\/|\.css$|\.scss$|modal|screen|layout|button|icon|theme/i, category: "UI" },
+  { pattern: /^balance\/|\/balance\/|damage|stat|weapon|skill|difficulty|level.*design/i, category: "Balance" },
+  { pattern: /^ads\/|\/ads\/|^monetization\/|advert|rewarded|interstitial|placement|banner/i, category: "Ads" },
+  { pattern: /^perf\/|\/perf\/|^performance\/|framerate|frame_rate|memory|optimis|optim[iz]/i, category: "Performance" },
+  { pattern: /^analytics\/|\/analytics\/|tracking|event.*log|metric|telemetry/i, category: "Analytics" },
+  { pattern: /^core\/|^engine\/|^platform\/|\/engine\/|architecture|renderer|physics/i, category: "Core" },
+  { pattern: /^tests?\/|__tests?__|\.test\.|\.spec\.|\.e2e\./i, category: "Tests" },
+  { pattern: /^fix\/|^hotfix\/|^bugfix\/|crash|null.*ptr|memory.*leak|fix.*bug|bug.*fix/i, category: "Bug Fix" },
+];
 
-const SYSTEM_PROMPT = `You are the GameDistrict PR Review Agent — an AI enforcer of atomic release discipline.
+const VAGUE_MESSAGES = [
+  /^(wip|misc|various|updates?|fixes?|changes?|stuff|things?|improvements?|tweaks?)$/i,
+  /various fixes/i, /misc updates/i, /some changes/i, /cleanup/i,
+  /lots of/i, /multiple/i, /bundle/i,
+];
 
-Your job is to analyze a GitHub pull request and determine if it is ATOMIC (single-purpose) or MIXED (multi-purpose).
+function classifyFile(filePath) {
+  for (const { pattern, category } of TAXONOMY) {
+    if (pattern.test(filePath)) return category;
+  }
+  const ext = filePath.split(".").pop().toLowerCase();
+  if (["js", "ts", "jsx", "tsx"].includes(ext)) return "Core";
+  if (["json"].includes(ext)) return "Config";
+  if (["md", "txt"].includes(ext)) return "Docs";
+  return "Other";
+}
 
-FILE PATH TAXONOMY — each file path maps to exactly one category:
-- economy/     → Economy (coin drops, IAP, currencies, pricing)
-- ui/ or components/ or styles/ → UI (layouts, visuals, modals, screens)
-- balance/     → Balance (damage values, stats, difficulty, game feel)
-- ads/ or monetization/ → Ads (ad placement, frequency, rewarded ads)
-- perf/ or performance/ → Performance (frame rate, memory, load times)
-- analytics/   → Analytics (tracking, events, metrics)
-- core/ or engine/ or platform/ → Core (engine, architecture, platform)
-- tests/ or __tests__/ or *.test.* or *.spec.* → Tests (unit/integration tests)
-- fix/ or hotfix/ or bugfix/ or any file with obvious bug fix context → Bug Fix
+function isVague(msg) {
+  return VAGUE_MESSAGES.some(p => p.test(msg.trim()));
+}
 
-RULES:
-1. If ALL changed files belong to ONE category → APPROVED (atomic)
-2. If files span TWO OR MORE categories → BLOCKED (mixed)
-3. If commit message is vague ("various fixes", "updates", "wip") → WARNING (bad message)
-4. Generate a hypothesis for approved PRs: what metric this change should move and by how much
+const HYPOTHESES = {
+  Economy: "Expected to shift IAP conversion rate by 5–12% — measure revenue per DAU and purchase funnel drop-off over 7 days post-activation.",
+  UI: "Expected to improve session engagement — measure tap-through rate on affected screens and D1 retention over 5 days.",
+  Balance: "Expected to normalise win-rate in affected bracket — measure match outcome distribution and player churn in that tier over 14 days.",
+  Ads: "Expected to shift ad revenue per session — measure eCPM, claim rate, and session length impact over 7 days.",
+  Performance: "Expected to reduce crash rate and improve session length — measure ANR rate, frame drop frequency, and avg session duration over 7 days.",
+  Analytics: "Expected to improve data completeness — validate event coverage in dashboard within 48 hours of activation.",
+  Core: "Expected to have no user-facing metric impact — monitor crash rate and ANR rate for 48 hours as a stability check.",
+  Tests: "No user-facing metric impact expected — validate CI pass rate and coverage delta in the pipeline.",
+  "Bug Fix": "Expected to reduce crash rate or error frequency for the specific scenario — monitor crash-free session rate for 5 days.",
+};
 
-Respond ONLY with valid JSON in this exact format:
-{
-  "verdict": "APPROVED" | "BLOCKED" | "WARNING",
-  "categories_detected": ["category1", "category2"],
-  "primary_category": "the main category",
-  "files_analysis": [
-    { "file": "path/to/file.js", "category": "Category", "reason": "brief reason" }
-  ],
-  "issues": ["issue 1 if any", "issue 2 if any"],
-  "hypothesis": "For APPROVED PRs: one sentence about what metric this is expected to move. For BLOCKED: empty string.",
-  "recommendation": "A concrete action for the developer to take",
-  "atomic_score": 0-100
-}`;
+const RECOMMENDATIONS = {
+  APPROVED: "This PR is atomic and ready to merge. Attach the auto-generated hypothesis to the feature flag and activate via the release gate agent.",
+  BLOCKED: "Split this PR into separate branches — one per category. Each should be merged, flagged, and activated independently so results can be attributed cleanly.",
+  WARNING: "Rewrite the commit message to follow the format: `type(scope): description of exactly one change`. Example: `balance: reduce sword damage 5% to normalise Gold+ win-rate`.",
+};
 
-export default async function handler(req, res) {
+export default function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
-  }
-
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey || apiKey.trim() === "") {
-    return res.status(500).json({
-      error:
-        "ANTHROPIC_API_KEY is not configured. Add it in Vercel Project Settings → Environment Variables, then trigger a new deployment.",
-    });
   }
 
   const { prTitle, prDescription, files, commitMessage } = req.body;
@@ -54,33 +60,83 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "PR title or files required" });
   }
 
-  const userMessage = `Analyze this GitHub Pull Request:
+  const fileList = (files || "")
+    .split("\n")
+    .map(f => f.trim())
+    .filter(Boolean);
 
-PR TITLE: ${prTitle || "Untitled"}
-COMMIT MESSAGE: ${commitMessage || prTitle || "No commit message"}
-DESCRIPTION: ${prDescription || "No description provided"}
+  // Classify each file
+  const filesAnalysis = fileList.map(file => {
+    const category = classifyFile(file);
+    const reasons = {
+      Economy: "matches economy/ path or economy-related naming",
+      UI: "matches ui/, components/, or style-related naming",
+      Balance: "matches balance/ path or stat/damage-related naming",
+      Ads: "matches ads/ or monetization/ path",
+      Performance: "matches perf/ or performance-related naming",
+      Analytics: "matches analytics/ or tracking-related naming",
+      Core: "matches core/ or engine/ path",
+      Tests: "matches test file pattern (*.test.*, __tests__/)",
+      "Bug Fix": "matches fix/ path or crash/bug-related naming",
+      Config: "JSON config file",
+      Docs: "documentation file",
+      Other: "no category match — review manually",
+    };
+    return { file, category, reason: reasons[category] || "classified by file path" };
+  });
 
-CHANGED FILES:
-${files || "No files listed"}
+  // Detect unique categories (ignore Docs/Config/Other for blocking)
+  const blockingCategories = [...new Set(
+    filesAnalysis
+      .map(f => f.category)
+      .filter(c => !["Docs", "Config", "Other"].includes(c))
+  )];
 
-Analyze for atomic discipline. Respond with JSON only.`;
+  const allCategories = [...new Set(filesAnalysis.map(f => f.category))];
+  const primaryCategory = blockingCategories[0] || allCategories[0] || "Unknown";
 
-  try {
-    const client = new Anthropic({ apiKey: apiKey.trim() });
+  // Check commit message
+  const msgToCheck = commitMessage || prTitle || "";
+  const vagueMsg = isVague(msgToCheck);
 
-    const message = await client.messages.create({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 1000,
-      system: SYSTEM_PROMPT,
-      messages: [{ role: "user", content: userMessage }],
-    });
+  // Determine verdict
+  let verdict, issues;
 
-    const text = message.content[0].text.trim();
-    const clean = text.replace(/```json\n?|```\n?/g, "").trim();
-    const result = JSON.parse(clean);
-    return res.status(200).json(result);
-  } catch (err) {
-    console.error("Agent error:", err);
-    return res.status(500).json({ error: "Agent failed: " + err.message });
+  if (blockingCategories.length >= 2) {
+    verdict = "BLOCKED";
+    issues = [
+      `${blockingCategories.length} categories detected in a single PR: ${blockingCategories.join(", ")}.`,
+      "Atomic release policy requires one category per PR. Each category must be a separate branch, separate merge, and separate feature flag.",
+      `Split into ${blockingCategories.length} PRs: ${blockingCategories.map(c => `one for ${c}`).join(", ")}.`,
+    ];
+  } else if (vagueMsg) {
+    verdict = "WARNING";
+    issues = [
+      `Commit message "${msgToCheck}" is too vague to generate a release hypothesis.`,
+      "A clear commit message is required so the release gate agent can auto-generate a metric hypothesis.",
+    ];
+  } else {
+    verdict = "APPROVED";
+    issues = [];
   }
+
+  // Atomic score
+  let atomicScore = 100;
+  if (blockingCategories.length >= 2) atomicScore = Math.max(10, 100 - (blockingCategories.length - 1) * 30);
+  if (vagueMsg) atomicScore = Math.min(atomicScore, 55);
+
+  const hypothesis = verdict === "APPROVED"
+    ? (HYPOTHESES[primaryCategory] || "Monitor primary KPIs for 7 days post-activation.")
+    : "";
+
+  return res.status(200).json({
+    verdict,
+    categories_detected: blockingCategories.length ? blockingCategories : allCategories,
+    primary_category: primaryCategory,
+    files_analysis: filesAnalysis,
+    issues,
+    hypothesis,
+    recommendation: RECOMMENDATIONS[verdict],
+    atomic_score: atomicScore,
+  });
 }
