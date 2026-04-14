@@ -1,6 +1,4 @@
-import Anthropic from "@anthropic-ai/sdk";
-
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const Anthropic = require("@anthropic-ai/sdk").default;
 
 const SYSTEM_PROMPT = `You are the GameDistrict PR Review Agent — an AI enforcer of atomic release discipline.
 
@@ -42,6 +40,14 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey || apiKey.trim() === "") {
+    return res.status(500).json({
+      error:
+        "ANTHROPIC_API_KEY is not configured. Add it in Vercel Project Settings → Environment Variables, then trigger a new deployment.",
+    });
+  }
+
   const { prTitle, prDescription, files, commitMessage } = req.body;
 
   if (!prTitle && !files) {
@@ -60,6 +66,8 @@ ${files || "No files listed"}
 Analyze for atomic discipline. Respond with JSON only.`;
 
   try {
+    const client = new Anthropic({ apiKey: apiKey.trim() });
+
     const message = await client.messages.create({
       model: "claude-sonnet-4-20250514",
       max_tokens: 1000,
